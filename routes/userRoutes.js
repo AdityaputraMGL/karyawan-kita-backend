@@ -29,17 +29,58 @@ emailTransporter.verify(function (error, success) {
 
 module.exports = function (prisma) {
   const router = express.Router();
+  // FILE: routes/userRoutes.js
+  // HANYA SECTION YANG PERLU DIUBAH - GANTI DARI LINE 30 SAMPAI LINE 123
 
-  // ✅ POST: Register user - UPDATED
+  // ✅ POST: Register user - UPDATED DENGAN FIELD BARU (Alamat, No HP, Jabatan)
   router.post("/register", async (req, res) => {
-    const { username, password, email, role, status_karyawan, nama_lengkap } =
-      req.body;
+    // ⭐ TAMBAH 3 FIELD BARU DARI FRONTEND
+    const {
+      username,
+      password,
+      email,
+      role,
+      status_karyawan,
+      nama_lengkap,
+      alamat, // ⭐ FIELD BARU
+      no_hp, // ⭐ FIELD BARU
+      jabatan, // ⭐ FIELD BARU
+      confirmPassword,
+    } = req.body;
 
     try {
-      // Validasi input
+      // Validasi input - UPDATED
       if (!username || !password || !email) {
         return res.status(400).json({
           error: "Username, password, dan email wajib diisi.",
+        });
+      }
+
+      // ⭐ VALIDASI NAMA LENGKAP (wajib)
+      if (!nama_lengkap || nama_lengkap.trim() === "") {
+        return res.status(400).json({
+          error: "Nama lengkap wajib diisi.",
+        });
+      }
+
+      // ⭐ VALIDASI PASSWORD COCOK
+      if (password !== confirmPassword) {
+        return res.status(400).json({
+          error: "Password dan konfirmasi password tidak cocok.",
+        });
+      }
+
+      // ⭐ VALIDASI PASSWORD MINIMAL 6 KARAKTER
+      if (password.length < 6) {
+        return res.status(400).json({
+          error: "Password minimal 6 karakter.",
+        });
+      }
+
+      // ⭐ VALIDASI NO HP (optional tapi jika ada harus valid)
+      if (no_hp && !/^[0-9+\-\s()]+$/.test(no_hp)) {
+        return res.status(400).json({
+          error: "Nomor HP tidak valid.",
         });
       }
 
@@ -97,13 +138,17 @@ module.exports = function (prisma) {
         status_karyawan: newUser.status_karyawan,
       });
 
-      // ⭐ SELALU create employee record (PENTING!)
+      // ⭐ CREATE EMPLOYEE DENGAN DATA LENGKAP (UPDATED)
       const employee = await prisma.employee.create({
         data: {
           user_id: newUser.user_id,
-          nama_lengkap: nama_lengkap || username, // Gunakan username jika nama_lengkap kosong
+          nama_lengkap: nama_lengkap.trim(), // ⭐ DARI FRONTEND, BUKAN USERNAME
+          alamat: alamat?.trim() || null, // ⭐ FIELD BARU
+          no_hp: no_hp?.trim() || null, // ⭐ FIELD BARU
+          jabatan: jabatan?.trim() || null, // ⭐ FIELD BARU
           status_karyawan: finalStatusKaryawan,
           gaji_pokok: gajiPokok,
+          tanggal_masuk: new Date(), // ⭐ TAMBAH TANGGAL MASUK
         },
       });
 
@@ -111,6 +156,9 @@ module.exports = function (prisma) {
         employee_id: employee.employee_id,
         user_id: employee.user_id,
         nama_lengkap: employee.nama_lengkap,
+        alamat: employee.alamat, // ⭐ LOG ALAMAT
+        no_hp: employee.no_hp, // ⭐ LOG NO HP
+        jabatan: employee.jabatan, // ⭐ LOG JABATAN
         status_karyawan: employee.status_karyawan,
         gaji_pokok: employee.gaji_pokok,
       });
@@ -121,7 +169,7 @@ module.exports = function (prisma) {
           userId: newUser.user_id,
           username: newUser.username,
           role: newUser.role,
-          employee_id: employee.employee_id, // ⭐ Sekarang PASTI ada
+          employee_id: employee.employee_id,
         },
         JWT_SECRET,
         { expiresIn: "24h" }
@@ -130,8 +178,14 @@ module.exports = function (prisma) {
       console.log("✅ Registration successful for:", username);
       console.log("  - User ID:", newUser.user_id);
       console.log("  - Employee ID:", employee.employee_id);
+      console.log("  - Nama Lengkap:", employee.nama_lengkap);
+      console.log("  - Alamat:", employee.alamat);
+      console.log("  - No HP:", employee.no_hp);
+      console.log("  - Jabatan:", employee.jabatan);
 
+      // ⭐ RESPONSE UPDATED - KIRIM EMPLOYEE DATA LENGKAP
       res.status(201).json({
+        message: "✅ Registrasi berhasil! Data karyawan telah tersimpan.",
         token,
         user: {
           user_id: newUser.user_id,
@@ -142,9 +196,28 @@ module.exports = function (prisma) {
           nama_lengkap: employee.nama_lengkap,
           status_karyawan: employee.status_karyawan,
         },
+        employee: {
+          employee_id: employee.employee_id,
+          nama_lengkap: employee.nama_lengkap,
+          alamat: employee.alamat,
+          no_hp: employee.no_hp,
+          jabatan: employee.jabatan,
+          status_karyawan: employee.status_karyawan,
+          gaji_pokok: employee.gaji_pokok,
+          tanggal_masuk: employee.tanggal_masuk,
+        },
       });
     } catch (error) {
       console.error("❌ Registration error:", error);
+
+      // Handle unique constraint error
+      if (error.code === "P2002") {
+        return res.status(400).json({
+          error: "Username atau email sudah terdaftar.",
+          details: error.message,
+        });
+      }
+
       res.status(500).json({
         error: "Registrasi gagal.",
         details: error.message,

@@ -6,6 +6,10 @@ const cors = require("cors");
 // Inisialisasi Prisma Client
 const prisma = new PrismaClient();
 
+const AlphaCheckService = require("./services/alphaCheckService");
+const alphaCheckService = new AlphaCheckService(prisma);
+alphaCheckService.setupCronJob();
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -96,6 +100,7 @@ const leaveRoutes = require("./routes/leaveRoutes");
 const performanceRoutes = require("./routes/performanceRoutes");
 const statsRoutes = require("./routes/statsRoutes");
 const passwordResetRoutes = require("./routes/passwordResetRoutes");
+const alphaRoutes = require("./routes/alphaRoutes");
 
 // ✅ Use Routes
 app.use("/api/employees", employeeRoutes(prisma));
@@ -106,6 +111,7 @@ app.use("/api/leave", leaveRoutes(prisma));
 app.use("/api/performance", performanceRoutes(prisma));
 app.use("/api/stats", statsRoutes(prisma));
 app.use("/api/auth", passwordResetRoutes);
+app.use("/api/alpha", alphaRoutes(prisma, alphaCheckService));
 
 // Error handling middleware
 app.use((err, req, res, next) => {

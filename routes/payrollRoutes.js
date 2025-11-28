@@ -4,39 +4,17 @@ const { authenticateToken, authorizeRole } = require("../middleware/auth");
 module.exports = function (prisma) {
   const router = express.Router();
 
-  // ✅ ENDPOINT KHUSUS UNTUK KARYAWAN - Melihat slip gaji sendiri
-  router.get("/my-slip", authenticateToken, async (req, res) => {
-    try {
-      const employeeId = req.user.employee_id;
+  // ========================================
+  // TARIF POTONGAN
+  // ========================================
+  const POTONGAN_ALPA = 100000; // Rp 100.000 per hari
+  const POTONGAN_TERLAMBAT = 25000; // Rp 25.000 per kejadian
+  const POTONGAN_IZIN = 50000; // Rp 50.000 per hari
+  const POTONGAN_SAKIT = 0; // Rp 0 (tidak ada potongan)
 
-      if (!employeeId) {
-        return res.status(400).json({
-          error: "Employee ID tidak ditemukan dalam token",
-        });
-      }
-
-      const myPayrolls = await prisma.payroll.findMany({
-        where: { employee_id: employeeId },
-        orderBy: { periode: "desc" },
-        include: {
-          employee: {
-            select: {
-              nama_lengkap: true,
-              jabatan: true,
-              status_karyawan: true,
-            },
-          },
-        },
-      });
-
-      res.json(myPayrolls);
-    } catch (error) {
-      console.error("Error fetching my payroll:", error);
-      res.status(500).json({ error: "Gagal mengambil slip gaji Anda." });
-    }
-  });
-
-  // ✅ GET: Calculate payroll otomatis dengan potongan cuti - FIXED VERSION
+  // ========================================
+  // GET: Calculate payroll otomatis
+  // ========================================
   router.get(
     "/calculate",
     authenticateToken,
@@ -97,7 +75,7 @@ module.exports = function (prisma) {
 
         console.log(`Total attendances in period: ${attendances.length}`);
 
-        // Get approved leaves - CRITICAL: Proper date filtering
+        // Get approved leaves
         const leaves = await prisma.leaveRequest.findMany({
           where: {
             status: "approved",
@@ -133,7 +111,6 @@ module.exports = function (prisma) {
         });
 
         console.log(`Total approved leaves in period: ${leaves.length}`);
-        console.log("Leaves data:", JSON.stringify(leaves, null, 2));
 
         // Calculate payroll for each employee
         const payrollData = [];
@@ -150,29 +127,40 @@ module.exports = function (prisma) {
 
           console.log(`  Attendances: ${empAttendances.length}`);
 
-          // Count ALPA
+          // ========================================
+          // COUNT ALPA (ALPHA)
+          // ========================================
           const alpaCount = empAttendances.filter(
             (a) => a.status?.toLowerCase() === "alpa"
           ).length;
-          const potonganAlpa = alpaCount * 100000;
-          console.log(`  Alpa: ${alpaCount} days = Rp ${potonganAlpa}`);
+          const potonganAlpa = alpaCount * POTONGAN_ALPA;
+          console.log(
+            `  ❌ Alpa: ${alpaCount} days = Rp ${potonganAlpa.toLocaleString()}`
+          );
 
-          // Count TERLAMBAT
+          // ========================================
+          // COUNT TERLAMBAT (LATE)
+          // ========================================
           const lateRecords = empAttendances.filter((a) => {
-            if (!a.jam_masuk || a.status?.toLowerCase() !== "hadir")
-              return false;
+            // Check if status is explicitly "terlambat"
+            if (a.status?.toLowerCase() === "terlambat") return true;
+
+            // Or check if jam_masuk is after 08:00
+            if (!a.jam_masuk) return false;
             const timeParts = a.jam_masuk.split(":");
             const hour = parseInt(timeParts[0]);
-            const minute = parseInt(timeParts[1]);
+            const minute = parseInt(timeParts[1] || 0);
             return hour > 8 || (hour === 8 && minute > 0);
           });
           const lateCount = lateRecords.length;
-          const potonganTerlambat = lateCount * 25000;
+          const potonganTerlambat = lateCount * POTONGAN_TERLAMBAT;
           console.log(
-            `  Terlambat: ${lateCount} times = Rp ${potonganTerlambat}`
+            `  ⏰ Terlambat: ${lateCount} times = Rp ${potonganTerlambat.toLocaleString()}`
           );
 
-          // Count IZIN/CUTI from attendance
+          // ========================================
+          // COUNT IZIN & SAKIT from attendance
+          // ========================================
           let izinCount = empAttendances.filter(
             (a) => a.status?.toLowerCase() === "izin"
           ).length;
@@ -181,31 +169,29 @@ module.exports = function (prisma) {
             (a) => a.status?.toLowerCase() === "sakit"
           ).length;
 
-          console.log(`  Izin dari attendance: ${izinCount} days`);
-          console.log(`  Sakit dari attendance: ${sakitCount} days`);
+          console.log(`  📝 Izin dari attendance: ${izinCount} days`);
+          console.log(`  🏥 Sakit dari attendance: ${sakitCount} days`);
 
-          // Add leaves (cuti) that are approved
+          // ========================================
+          // ADD LEAVES (CUTI)
+          // ========================================
           const empLeaves = leaves.filter(
             (l) => l.employee_id === employee.employee_id
           );
 
-          console.log(
-            `  Leave requests for this employee: ${empLeaves.length}`
-          );
+          console.log(`  📋 Leave requests: ${empLeaves.length}`);
 
           empLeaves.forEach((leave, idx) => {
             console.log(`  Leave ${idx + 1}:`, {
-              leave_id: leave.leave_id,
               jenis: leave.jenis_pengajuan,
-              mulai: leave.tanggal_mulai,
-              selesai: leave.tanggal_selesai,
-              status: leave.status,
+              mulai: leave.tanggal_mulai.toISOString().split("T")[0],
+              selesai: leave.tanggal_selesai.toISOString().split("T")[0],
             });
 
             const start = new Date(leave.tanggal_mulai);
             const end = new Date(leave.tanggal_selesai);
 
-            // Calculate days difference
+            // Calculate days
             const diffTime = Math.abs(end.getTime() - start.getTime());
             const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
 
@@ -215,27 +201,33 @@ module.exports = function (prisma) {
 
             if (jenisLower.includes("sakit")) {
               sakitCount += diffDays;
-              console.log(`    Added to sakit count`);
+              console.log(`    → Added to sakit count`);
             } else {
               // Default: Izin/Cuti
               izinCount += diffDays;
-              console.log(`    Added to izin/cuti count`);
+              console.log(`    → Added to izin/cuti count`);
             }
           });
 
           console.log(`  TOTAL Izin/Cuti: ${izinCount} days`);
           console.log(`  TOTAL Sakit: ${sakitCount} days`);
 
-          // Calculate deductions
-          const potonganIzin = izinCount * 50000;
-          const potonganSakit = sakitCount * 0;
+          // ========================================
+          // CALCULATE TOTAL DEDUCTIONS
+          // ========================================
+          const potonganIzin = izinCount * POTONGAN_IZIN;
+          const potonganSakit = sakitCount * POTONGAN_SAKIT;
 
           const totalPotongan =
             potonganAlpa + potonganTerlambat + potonganIzin + potonganSakit;
 
-          console.log(`  TOTAL POTONGAN: Rp ${totalPotongan}`);
+          console.log(
+            `  💰 TOTAL POTONGAN: Rp ${totalPotongan.toLocaleString()}`
+          );
 
-          // Build breakdown and reason
+          // ========================================
+          // BUILD BREAKDOWN
+          // ========================================
           const breakdown = [];
           const reasons = [];
 
@@ -292,7 +284,9 @@ module.exports = function (prisma) {
           const alasanPotongan =
             reasons.length > 0 ? reasons.join(" | ") : "Tidak ada potongan";
 
-          // Calculate net salary
+          // ========================================
+          // CALCULATE NET SALARY
+          // ========================================
           const basicSalary = parseFloat(employee.gaji_pokok) || 5000000;
           const netSalary = basicSalary - totalPotongan;
 
@@ -359,7 +353,43 @@ module.exports = function (prisma) {
     }
   );
 
-  // ✅ GET: Get all payroll (Admin & HR only)
+  // ========================================
+  // GET: Slip gaji sendiri (Karyawan)
+  // ========================================
+  router.get("/my-slip", authenticateToken, async (req, res) => {
+    try {
+      const employeeId = req.user.employee_id;
+
+      if (!employeeId) {
+        return res.status(400).json({
+          error: "Employee ID tidak ditemukan dalam token",
+        });
+      }
+
+      const myPayrolls = await prisma.payroll.findMany({
+        where: { employee_id: employeeId },
+        orderBy: { periode: "desc" },
+        include: {
+          employee: {
+            select: {
+              nama_lengkap: true,
+              jabatan: true,
+              status_karyawan: true,
+            },
+          },
+        },
+      });
+
+      res.json(myPayrolls);
+    } catch (error) {
+      console.error("Error fetching my payroll:", error);
+      res.status(500).json({ error: "Gagal mengambil slip gaji Anda." });
+    }
+  });
+
+  // ========================================
+  // GET: All payroll (Admin & HR) ⭐ WITH ORPHAN FILTERING
+  // ========================================
   router.get(
     "/",
     authenticateToken,
@@ -392,7 +422,20 @@ module.exports = function (prisma) {
           },
         });
 
-        res.json(payrolls);
+        // ⭐ Filter out payroll records with null employee
+        const validPayrolls = payrolls.filter(
+          (payroll) => payroll.employee !== null
+        );
+
+        if (validPayrolls.length < payrolls.length) {
+          console.log(
+            `⚠️ Filtered out ${
+              payrolls.length - validPayrolls.length
+            } payroll records with missing employee`
+          );
+        }
+
+        res.json(validPayrolls);
       } catch (error) {
         console.error("Error fetching payroll:", error);
         res.status(500).json({ error: "Gagal mengambil data payroll." });
@@ -400,7 +443,9 @@ module.exports = function (prisma) {
     }
   );
 
-  // ✅ POST: Create payroll (Admin & HR only)
+  // ========================================
+  // POST: Create payroll
+  // ========================================
   router.post(
     "/",
     authenticateToken,
@@ -418,7 +463,7 @@ module.exports = function (prisma) {
       } = req.body;
 
       try {
-        // Check if payroll already exists
+        // Check if already exists
         const existing = await prisma.payroll.findFirst({
           where: {
             employee_id: parseInt(employee_id),
@@ -432,7 +477,7 @@ module.exports = function (prisma) {
           });
         }
 
-        // Create new payroll
+        // Create
         const newPayroll = await prisma.payroll.create({
           data: {
             employee_id: parseInt(employee_id),
@@ -447,7 +492,6 @@ module.exports = function (prisma) {
         });
 
         console.log("✅ Payroll created:", newPayroll.payroll_id);
-
         res.status(201).json(newPayroll);
       } catch (error) {
         console.error("Error creating payroll:", error);
@@ -459,7 +503,9 @@ module.exports = function (prisma) {
     }
   );
 
-  // ✅ PUT: Update payroll
+  // ========================================
+  // PUT: Update payroll
+  // ========================================
   router.put(
     "/:id",
     authenticateToken,
@@ -495,7 +541,6 @@ module.exports = function (prisma) {
         });
 
         console.log("✅ Payroll updated:", id);
-
         res.json(updatedPayroll);
       } catch (error) {
         console.error("Error updating payroll:", error);
@@ -507,7 +552,9 @@ module.exports = function (prisma) {
     }
   );
 
-  // ✅ DELETE: Delete payroll
+  // ========================================
+  // DELETE: Delete payroll
+  // ========================================
   router.delete(
     "/:id",
     authenticateToken,
@@ -521,7 +568,6 @@ module.exports = function (prisma) {
         });
 
         console.log("✅ Payroll deleted:", id);
-
         res.json({ message: "Data payroll berhasil dihapus." });
       } catch (error) {
         console.error("Error deleting payroll:", error);
@@ -533,7 +579,9 @@ module.exports = function (prisma) {
     }
   );
 
-  // ✅ GET: Statistics
+  // ========================================
+  // GET: Statistics
+  // ========================================
   router.get(
     "/stats",
     authenticateToken,

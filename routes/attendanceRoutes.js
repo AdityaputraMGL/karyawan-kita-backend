@@ -4,6 +4,10 @@ const authMiddleware = require("../middleware/auth");
 module.exports = function (prisma) {
   const router = express.Router();
 
+  // Constants
+  const POTONGAN_TERLAMBAT = 25000; // Rp 25.000 per kejadian
+  const POTONGAN_ALPHA = 100000; // Rp 100.000 per hari (for reference)
+
   // Helper function untuk normalize employee_id sesuai tipe di database
   function normalizeEmployeeId(employeeId) {
     if (!employeeId && employeeId !== 0) return null;
@@ -12,11 +16,87 @@ module.exports = function (prisma) {
     const parsed = parseInt(employeeId);
 
     if (isNaN(parsed)) {
-      console.error("⚠ Invalid employee_id:", employeeId);
+      console.error("⚠️ Invalid employee_id:", employeeId);
       return null;
     }
 
     return parsed;
+  }
+
+  // ⭐ Helper function untuk apply auto potongan terlambat
+  async function applyLateDeduction(employeeId, tanggal, jamMasuk) {
+    const targetDate = tanggal ? new Date(tanggal) : new Date();
+    const currentMonth = targetDate.toISOString().slice(0, 7); // Format: YYYY-MM
+
+    console.log(`⚠️ TERLAMBAT detected - Auto applying deduction...`);
+    console.log(`   Employee ID: ${employeeId}`);
+    console.log(`   Date: ${targetDate.toISOString().slice(0, 10)}`);
+    console.log(`   Time: ${jamMasuk}`);
+
+    try {
+      // Find or create payroll for this month
+      let payroll = await prisma.payroll.findFirst({
+        where: {
+          employee_id: employeeId,
+          periode: currentMonth,
+        },
+      });
+
+      if (!payroll) {
+        // Create new payroll with late deduction
+        payroll = await prisma.payroll.create({
+          data: {
+            employee_id: employeeId,
+            periode: currentMonth,
+            gaji_pokok: 0, // Will be set by admin later
+            tunjangan: 0,
+            potongan: POTONGAN_TERLAMBAT,
+            gaji_bersih: -POTONGAN_TERLAMBAT,
+            alasan_potongan: `Terlambat ${targetDate
+              .toISOString()
+              .slice(0, 10)} jam ${jamMasuk}`,
+          },
+        });
+
+        console.log(
+          `  💰 Created Payroll with late deduction: Rp ${POTONGAN_TERLAMBAT.toLocaleString()}`
+        );
+      } else {
+        // Update existing payroll
+        const newPotongan = (payroll.potongan || 0) + POTONGAN_TERLAMBAT;
+        const newGajiBersih =
+          (payroll.gaji_pokok || 0) + (payroll.tunjangan || 0) - newPotongan;
+
+        const updatedAlasanPotongan = payroll.alasan_potongan
+          ? `${payroll.alasan_potongan}; Terlambat ${targetDate
+              .toISOString()
+              .slice(0, 10)} jam ${jamMasuk}`
+          : `Terlambat ${targetDate
+              .toISOString()
+              .slice(0, 10)} jam ${jamMasuk}`;
+
+        await prisma.payroll.update({
+          where: { payroll_id: payroll.payroll_id },
+          data: {
+            potongan: newPotongan,
+            gaji_bersih: newGajiBersih,
+            alasan_potongan: updatedAlasanPotongan,
+          },
+        });
+
+        console.log(
+          `  💰 Updated Payroll - Total Potongan: Rp ${newPotongan.toLocaleString()}`
+        );
+      }
+
+      return true;
+    } catch (payrollError) {
+      console.error(
+        "❌ Error updating payroll for late deduction:",
+        payrollError
+      );
+      return false;
+    }
   }
 
   // ✅ GET semua data absensi - ROLE-AWARE dengan ENHANCED DEBUGGING
@@ -100,13 +180,26 @@ module.exports = function (prisma) {
         },
       });
 
+      // ⭐ Filter out attendance records with null employee
+      const validAttendanceList = attendanceList.filter(
+        (attendance) => attendance.employee !== null
+      );
+
+      if (validAttendanceList.length < attendanceList.length) {
+        console.log(
+          `⚠️ Filtered out ${
+            attendanceList.length - validAttendanceList.length
+          } attendance records with missing employee`
+        );
+      }
+
       console.log("\n✅ Query executed successfully");
       console.log("📦 Results:");
-      console.log("   - Total records found:", attendanceList.length);
+      console.log("   - Total records found:", validAttendanceList.length);
 
-      if (attendanceList.length > 0) {
+      if (validAttendanceList.length > 0) {
         console.log("   - Sample record:");
-        const sample = attendanceList[0];
+        const sample = validAttendanceList[0];
         console.log("     * attendance_id:", sample.attendance_id);
         console.log(
           "     * employee_id:",
@@ -122,7 +215,7 @@ module.exports = function (prisma) {
           sample.employee?.nama_lengkap || "N/A"
         );
       } else {
-        console.log("   ⚠ No records found!");
+        console.log("   ⚠️ No records found!");
 
         // Additional debugging - check if ANY attendance exists for this employee
         if (whereClause.employee_id) {
@@ -148,7 +241,7 @@ module.exports = function (prisma) {
 
       console.log("=".repeat(60) + "\n");
 
-      res.json(attendanceList);
+      res.json(validAttendanceList);
     } catch (error) {
       console.error("\n" + "❌".repeat(30));
       console.error("❌ Error fetching attendance:");
@@ -379,7 +472,7 @@ module.exports = function (prisma) {
     }
   });
 
-  // ✅ POST: Mencatat absensi - ROLE-AWARE
+  // ✅ POST: Mencatat absensi - ROLE-AWARE ⭐ WITH AUTO POTONGAN FOR MANUAL ENTRY
   router.post("/", authMiddleware.authenticateToken, async (req, res) => {
     const { role, employee_id: userEmployeeId } = req.user;
     const {
@@ -423,6 +516,8 @@ module.exports = function (prisma) {
 
       console.log("📥 Creating attendance with data:");
       console.log("   - employee_id:", normalizedTargetId);
+      console.log("   - status:", status);
+      console.log("   - jam_masuk:", jam_masuk);
       console.log("   - lokasi_masuk:", lokasi_masuk);
       console.log("   - akurasi_masuk:", akurasi_masuk);
 
@@ -448,6 +543,13 @@ module.exports = function (prisma) {
       console.log("✅ Attendance saved to DB:", newAttendance.attendance_id);
       console.log("   - lokasi_masuk saved:", newAttendance.lokasi_masuk);
       console.log("   - akurasi_masuk saved:", newAttendance.akurasi_masuk);
+      console.log("   - status saved:", newAttendance.status);
+
+      // ⭐⭐⭐ AUTO POTONGAN FOR MANUAL ENTRY IF TERLAMBAT ⭐⭐⭐
+      if (status === "terlambat" && jam_masuk) {
+        console.log("⚠️ Manual entry with TERLAMBAT status detected!");
+        await applyLateDeduction(normalizedTargetId, tanggal, jam_masuk);
+      }
 
       res.status(201).json(newAttendance);
     } catch (error) {
@@ -527,7 +629,7 @@ module.exports = function (prisma) {
     }
   });
 
-  // ✅ POST: Check-in - ROLE-AWARE
+  // ✅ POST: Check-in dengan Logic Terlambat + AUTO POTONGAN ⭐ UPDATED
   router.post(
     "/checkin",
     authMiddleware.authenticateToken,
@@ -540,7 +642,14 @@ module.exports = function (prisma) {
         lokasi_masuk,
         akurasi_masuk,
       } = req.body;
-      const today = new Date().toISOString().slice(0, 10);
+
+      const now = new Date();
+      const currentHour = now.getHours();
+      const currentMinute = now.getMinutes();
+      const currentTime = `${String(currentHour).padStart(2, "0")}:${String(
+        currentMinute
+      ).padStart(2, "0")}`;
+      const today = now.toISOString().slice(0, 10);
 
       try {
         let targetEmployeeId;
@@ -562,7 +671,15 @@ module.exports = function (prisma) {
             .json({ error: "employee_id tidak dapat ditentukan." });
         }
 
-        // ⭐ FIX: Cek apakah sudah ada attendance dengan jam_masuk terisi
+        // ⭐ CHECK 1: Sudah lewat jam 18:00? → TIDAK BISA ABSEN
+        if (currentHour >= 18) {
+          return res.status(400).json({
+            error: "Absensi sudah ditutup. Waktu absen: 06:00 - 17:59",
+            currentTime: currentTime,
+          });
+        }
+
+        // ⭐ CHECK 2: Cek apakah sudah check-in hari ini
         const existingAttendance = await prisma.attendance.findFirst({
           where: {
             employee_id: targetEmployeeId,
@@ -573,7 +690,7 @@ module.exports = function (prisma) {
               ),
             },
             jam_masuk: {
-              not: null, // ⭐ PENTING: Hanya cek yang sudah punya jam_masuk
+              not: null,
             },
           },
         });
@@ -581,10 +698,25 @@ module.exports = function (prisma) {
         if (existingAttendance) {
           return res.status(400).json({
             error: "Sudah melakukan check-in hari ini.",
+            attendance: existingAttendance,
           });
         }
 
-        // ⭐ FIX: Cek apakah ada pending request yang sudah approved tapi belum check-in
+        // ⭐ CHECK 3: Tentukan status berdasarkan waktu
+        let status = "hadir";
+        let keterangan = null;
+
+        if (currentHour >= 8) {
+          // Setelah jam 08:00 → Terlambat
+          status = "terlambat";
+          keterangan = `Terlambat check-in pada ${currentTime}`;
+          console.log(`⚠️ Late check-in detected: ${currentTime}`);
+        } else {
+          // Sebelum jam 08:00 → Normal
+          console.log(`✅ On-time check-in: ${currentTime}`);
+        }
+
+        // ⭐ CHECK 4: Cek apakah ada approved request (WFH/Hybrid)
         const approvedRequest = await prisma.attendance.findFirst({
           where: {
             employee_id: targetEmployeeId,
@@ -595,24 +727,23 @@ module.exports = function (prisma) {
               ),
             },
             approval_status: "approved",
-            jam_masuk: null, // Belum check-in
+            jam_masuk: null,
           },
         });
 
-        // Jika ada approved request, UPDATE record tersebut
+        // ⭐ CREATE/UPDATE ATTENDANCE
+        let attendanceRecord;
+
         if (approvedRequest) {
-          const updatedAttendance = await prisma.attendance.update({
+          // Update existing approved request
+          attendanceRecord = await prisma.attendance.update({
             where: { attendance_id: approvedRequest.attendance_id },
             data: {
-              jam_masuk:
-                jam_masuk ||
-                new Date().toLocaleTimeString("id-ID", {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                }),
+              jam_masuk: jam_masuk || currentTime,
               lokasi_masuk: lokasi_masuk || null,
               akurasi_masuk: akurasi_masuk ? parseInt(akurasi_masuk) : null,
-              status: "hadir",
+              status: status,
+              keterangan: keterangan,
               recorded_by_role: role,
             },
             include: {
@@ -623,35 +754,64 @@ module.exports = function (prisma) {
           console.log(
             `✅ Check-in successful (updated approved request) by ${role} for employee ${targetEmployeeId}`
           );
-          return res.status(200).json(updatedAttendance);
+        } else {
+          // Create new attendance record
+          attendanceRecord = await prisma.attendance.create({
+            data: {
+              employee_id: targetEmployeeId,
+              tanggal: new Date(today),
+              jam_masuk: jam_masuk || currentTime,
+              tipe_kerja: tipe_kerja || "WFO",
+              lokasi_masuk: lokasi_masuk || null,
+              akurasi_masuk: akurasi_masuk ? parseInt(akurasi_masuk) : null,
+              status: status,
+              keterangan: keterangan,
+              recorded_by_role: role,
+            },
+            include: {
+              employee: true,
+            },
+          });
+
+          console.log(
+            `✅ Check-in successful (new record) by ${role} for employee ${targetEmployeeId}`
+          );
         }
 
-        // Jika tidak ada request, buat attendance baru (untuk WFO)
-        const newAttendance = await prisma.attendance.create({
-          data: {
-            employee_id: targetEmployeeId,
-            tanggal: new Date(today),
-            jam_masuk:
-              jam_masuk ||
-              new Date().toLocaleTimeString("id-ID", {
-                hour: "2-digit",
-                minute: "2-digit",
-              }),
-            tipe_kerja: tipe_kerja || "WFO",
-            lokasi_masuk: lokasi_masuk || null,
-            akurasi_masuk: akurasi_masuk ? parseInt(akurasi_masuk) : null,
-            status: "hadir",
-            recorded_by_role: role,
-          },
-          include: {
-            employee: true,
-          },
-        });
-
         console.log(
-          `✅ Check-in successful (new record) by ${role} for employee ${targetEmployeeId}`
+          "✅ Attendance record created:",
+          attendanceRecord.attendance_id
         );
-        res.status(201).json(newAttendance);
+
+        // ⭐⭐⭐ AUTO POTONGAN TERLAMBAT ⭐⭐⭐
+        if (status === "terlambat") {
+          await applyLateDeduction(
+            targetEmployeeId,
+            today,
+            jam_masuk || currentTime
+          );
+        }
+
+        // ⭐ RESPONSE MESSAGE
+        let message = `✓ Absen Masuk berhasil pada ${currentTime}`;
+
+        if (status === "terlambat") {
+          const lateHours = currentHour - 8;
+          const lateMinutes = currentMinute;
+
+          message =
+            `⚠️ Check-in berhasil (TERLAMBAT) pada ${currentTime}\n` +
+            `Anda terlambat ${lateHours} jam ${lateMinutes} menit.\n` +
+            `Potongan gaji: Rp ${POTONGAN_TERLAMBAT.toLocaleString()}\n` +
+            `Harap datang tepat waktu besok (sebelum 08:00).`;
+        }
+
+        res.status(approvedRequest ? 200 : 201).json({
+          message: message,
+          status: status,
+          potongan: status === "terlambat" ? POTONGAN_TERLAMBAT : 0,
+          data: attendanceRecord,
+        });
       } catch (error) {
         console.error("Error creating attendance:", error);
         res.status(400).json({

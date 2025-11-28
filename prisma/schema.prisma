@@ -3,81 +3,78 @@ generator client {
 }
 
 datasource db {
-  provider = "mysql"
-  url      = env("DATABASE_URL")
-  // ✅ FIXED: Ganti referentialIntegrity dengan relationMode
+  provider     = "mysql"
+  url          = env("DATABASE_URL")
   relationMode = "prisma"
 }
 
 model User {
-  user_id         Int                     @id @default(autoincrement())
-  username        String                  @unique @db.VarChar(50)
-  password        String                  @db.VarChar(255)
-  email           String                  @unique @db.VarChar(100)
-  role            String                  @default("Karyawan") @db.VarChar(20)
-  status_karyawan String                  @default("Magang") @db.VarChar(20)
-  created_at      DateTime                @default(now())
-  employee        Employee?
-  reset_tokens    password_reset_tokens[]
-  
-  // ⭐ APPROVAL RELATION
-  approvedAttendances Attendance[]        @relation("AttendanceApprovals")
+  user_id             Int                     @id @default(autoincrement())
+  username            String                  @unique @db.VarChar(50)
+  password            String                  @db.VarChar(255)
+  email               String                  @unique @db.VarChar(100)
+  role                String                  @default("Karyawan") @db.VarChar(20)
+  status_karyawan     String                  @default("Magang") @db.VarChar(20)
+  created_at          DateTime                @default(now())
+  employee            Employee?
+  reset_tokens        password_reset_tokens[]
+  approvedAttendances Attendance[]            @relation("AttendanceApprovals")
 
   @@map("users")
 }
 
 model Employee {
-  employee_id     Int            @id @default(autoincrement())
-  user_id         Int?           @unique
-  nama_lengkap    String         @db.VarChar(100)
-  alamat          String?        @db.Text
-  no_hp           String?        @db.VarChar(20)
-  jabatan         String?        @db.VarChar(50)
-  tanggal_masuk   DateTime?
-  status_karyawan String         @default("Tetap") @db.VarChar(20)
-  gaji_pokok      Decimal        @default(5000000.00) @db.Decimal(15, 2)
-  created_at      DateTime       @default(now())
-  attendance      Attendance[]
-  user            User?          @relation(fields: [user_id], references: [user_id])
-  leave_requests  LeaveRequest[]
-  payroll         Payroll[]
-  performance     Performance[]
+  employee_id        Int            @id @default(autoincrement())
+  user_id            Int?           @unique
+  nama_lengkap       String         @db.VarChar(100)
+  alamat             String?        @db.Text
+  no_hp              String?        @db.VarChar(20)
+  jabatan            String?        @db.VarChar(50)
+  tanggal_masuk      DateTime?
+  status_karyawan    String         @default("Tetap") @db.VarChar(20)
+  gaji_pokok         Decimal        @default(5000000.00) @db.Decimal(15, 2)
+  created_at         DateTime       @default(now())
+  monthly_leave_quota          Int     @default(3)
+  current_month                String? @db.VarChar(7)
+  used_leave_days_this_month   Int     @default(0)
+  attendance         Attendance[]
+  user               User?          @relation(fields: [user_id], references: [user_id])
+  leave_requests     LeaveRequest[]
+  payroll            Payroll[]
+  performance        Performance[]
 
   @@map("employees")
 }
 
 model Attendance {
-  attendance_id    Int      @id @default(autoincrement())
+  attendance_id    Int                         @id @default(autoincrement())
   employee_id      Int
   tanggal          DateTime
-  jam_masuk        String?  @db.VarChar(10)
-  jam_pulang       String?  @db.VarChar(10)
-  status           String   @default("hadir") @db.VarChar(20)
-  tipe_kerja       String   @default("WFO") @db.VarChar(20)
-  lokasi_masuk     String?  @db.VarChar(100)
-  lokasi_pulang    String?  @db.VarChar(100)
+  jam_masuk        String?                     @db.VarChar(10)
+  jam_pulang       String?                     @db.VarChar(10)
+  status           String                      @default("hadir") @db.VarChar(20)
+  keterangan       String?                     @db.Text
+  tipe_kerja       String                      @default("WFO") @db.VarChar(20)
+  approval_status  attendance_approval_status? @default(approved)
+  approved_by      Int?
+  approval_notes   String?                     @db.Text
+  approval_date    DateTime?                   @db.DateTime(0)
+  lokasi_masuk     String?                     @db.VarChar(100)
+  lokasi_pulang    String?                     @db.VarChar(100)
   akurasi_masuk    Int?
   akurasi_pulang   Int?
-  recorded_by_role String?  @db.VarChar(20)
-  status_approval  String   @default("approved") @db.VarChar(20)
-  
-  // ⭐ APPROVAL FIELDS
-  approval_status  String?  @default("approved") @db.VarChar(20)
-  approved_by      Int?
-  approval_notes   String?  @db.Text
-  approval_date    DateTime?
-  
-  created_at       DateTime @default(now())
-  
-  // RELATIONS
-  employee         Employee @relation(fields: [employee_id], references: [employee_id], onDelete: Cascade)
-  
-  // ⭐ APPROVAL RELATION (HARUS ADA INI!)
-  approver         User?    @relation("AttendanceApprovals", fields: [approved_by], references: [user_id], onDelete: SetNull)
+  recorded_by_role String?                     @db.VarChar(20)
+  status_approval  String                      @default("approved") @db.VarChar(20)
+  created_at       DateTime                    @default(now())
+  employee         Employee                    @relation(fields: [employee_id], references: [employee_id], onDelete: Cascade)
+  approver         User?                       @relation("AttendanceApprovals", fields: [approved_by], references: [user_id], onDelete: SetNull)
 
   @@index([employee_id])
   @@index([tanggal])
-  @@index([approval_status])
+  @@index([approved_by], map: "approved_by")
+  @@index([approval_status], map: "idx_attendance_approval")
+  @@index([employee_id, tanggal], map: "idx_attendance_employee_date")
+  @@index([tipe_kerja], map: "idx_attendance_tipe_kerja")
   @@map("attendance")
 }
 
@@ -91,6 +88,9 @@ model LeaveRequest {
   alasan            String   @db.Text
   status            String   @default("pending") @db.VarChar(20)
   created_at        DateTime @default(now())
+  total_days        Int      @default(0)
+  attachment_path     String?  @db.VarChar(255)
+  attachment_filename String?  @db.VarChar(255)
   employee          Employee @relation(fields: [employee_id], references: [employee_id], onDelete: Cascade)
 
   @@index([employee_id])
@@ -132,16 +132,19 @@ model Performance {
 model password_reset_tokens {
   id         Int      @id @default(autoincrement())
   user_id    Int
-  token      String   @unique @db.VarChar(191)
-  expires_at DateTime @db.DateTime(3)
-  created_at DateTime @default(now()) @db.DateTime(3)
+  token      String   @unique
+  expires_at DateTime
+  created_at DateTime @default(now())
+  user       User     @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
 
-  // Relasi ke model User dengan onDelete Cascade
-  user User @relation(fields: [user_id], references: [user_id], onDelete: Cascade) 
-
-  // Index untuk optimasi query
   @@index([user_id])
   @@index([token])
   @@index([expires_at])
   @@map("password_reset_tokens")
+}
+
+enum attendance_approval_status {
+  pending
+  approved
+  rejected
 }

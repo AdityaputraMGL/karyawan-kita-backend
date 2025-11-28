@@ -1,32 +1,37 @@
 const express = require("express");
 const { authenticateToken, authorizeRole } = require("../middleware/auth");
+const upload = require("../middleware/upload");
+const path = require("path");
+const fs = require("fs");
+const {
+  calculateLeaveDays,
+  getCurrentMonth,
+  checkAndResetMonthlyQuota,
+  checkLeaveQuota,
+  updateEmployeeLeaveQuota,
+  restoreLeaveQuota,
+} = require("../services/leaveService");
 
 module.exports = function (prisma) {
   const router = express.Router();
 
-  // ✅ GET - UNTUK SEMUA ROLE (Karyawan lihat milik sendiri, Admin/HR lihat semua)
+  // Serve static files for uploads
+  router.use("/uploads", express.static(path.join(__dirname, "../uploads")));
+
+  // GET - All leave requests
   router.get("/", authenticateToken, async (req, res) => {
     try {
       const userRole = req.user.role;
       const employeeId = req.user.employeeId || req.user.employee_id;
 
-      console.log("\n📋 Fetching leave requests:");
-      console.log("  - User role:", userRole);
-      console.log("  - Employee ID:", employeeId);
-
       let whereClause = {};
-
-      // Jika Karyawan, hanya tampilkan cuti mereka sendiri
       if (userRole === "Karyawan") {
         if (!employeeId) {
-          return res.status(400).json({
-            error: "Employee ID tidak ditemukan dalam token.",
-          });
+          return res
+            .status(400)
+            .json({ error: "Employee ID tidak ditemukan." });
         }
         whereClause = { employee_id: parseInt(employeeId) };
-        console.log("  - Filter: Only employee's own leave");
-      } else {
-        console.log("  - Filter: All leaves (Admin/HR)");
       }
 
       const leaveRequests = await prisma.leaveRequest.findMany({
@@ -34,227 +39,264 @@ module.exports = function (prisma) {
         orderBy: { tanggal_pengajuan: "desc" },
         include: {
           employee: {
-            select: {
-              nama_lengkap: true,
-              jabatan: true,
-            },
+            select: { nama_lengkap: true, jabatan: true },
           },
         },
       });
 
-      console.log("  - Found leave requests:", leaveRequests.length);
       res.json(leaveRequests);
     } catch (error) {
-      console.error("❌ Error fetching leave requests:", error);
-      res.status(500).json({ error: "Gagal mengambil data permintaan cuti." });
+      console.error("❌ Error:", error);
+      res.status(500).json({ error: "Gagal mengambil data." });
     }
   });
 
-  // ✅ GET permintaan cuti berdasarkan ID Karyawan (untuk backward compatibility)
-  router.get("/employee/:employeeId", authenticateToken, async (req, res) => {
-    const { employeeId } = req.params;
-    const currentUserId = req.user.userId;
-    const currentUserRole = req.user.role;
-
+  // GET quota
+  router.get("/quota", authenticateToken, async (req, res) => {
     try {
+      const employeeId = req.user.employeeId || req.user.employee_id;
+      if (!employeeId) {
+        return res.status(400).json({ error: "Employee ID tidak ditemukan." });
+      }
+
+      await checkAndResetMonthlyQuota(prisma, employeeId);
+
       const employee = await prisma.employee.findUnique({
         where: { employee_id: parseInt(employeeId) },
-        select: { user_id: true },
-      });
-
-      if (!employee) {
-        return res.status(404).json({ error: "Karyawan tidak ditemukan." });
-      }
-
-      // Otorisasi: Karyawan hanya bisa melihat cuti miliknya
-      const isSelf = employee.user_id === currentUserId;
-      if (currentUserRole !== "Admin" && currentUserRole !== "HR" && !isSelf) {
-        return res.status(403).json({ error: "Akses ditolak." });
-      }
-
-      const requests = await prisma.leaveRequest.findMany({
-        where: { employee_id: parseInt(employeeId) },
-        orderBy: { tanggal_pengajuan: "desc" },
-        include: {
-          employee: {
-            select: {
-              nama_lengkap: true,
-              jabatan: true,
-            },
-          },
+        select: {
+          nama_lengkap: true,
+          monthly_leave_quota: true,
+          used_leave_days_this_month: true,
         },
       });
-      res.json(requests);
+
+      res.json({
+        employee_name: employee.nama_lengkap,
+        month: getCurrentMonth(),
+        total_quota: employee.monthly_leave_quota,
+        used_days: employee.used_leave_days_this_month,
+        remaining_days:
+          employee.monthly_leave_quota - employee.used_leave_days_this_month,
+      });
     } catch (error) {
-      console.error("Error fetching employee leave:", error);
-      res.status(500).json({ error: "Gagal mengambil data cuti." });
+      console.error("❌ Error:", error);
+      res.status(500).json({ error: "Gagal mengambil kuota." });
     }
   });
 
-  // ✅ POST - Karyawan mengajukan cuti (OTOMATIS AMBIL EMPLOYEE_ID DARI TOKEN)
-  router.post("/", authenticateToken, async (req, res) => {
-    try {
-      const { tanggal_mulai, tanggal_selesai, jenis_pengajuan, alasan } =
-        req.body;
+  // POST - Create leave (with file upload for "Sakit")
+  router.post(
+    "/",
+    authenticateToken,
+    upload.single("attachment"),
+    async (req, res) => {
+      try {
+        const { tanggal_mulai, tanggal_selesai, jenis_pengajuan, alasan } =
+          req.body;
+        const employeeId = req.user.employeeId || req.user.employee_id;
 
-      // Ambil employee_id dari token JWT
-      const employeeId = req.user.employeeId || req.user.employee_id;
-      const userId = req.user.userId || req.user.id;
+        console.log("\n📝 Creating leave:", jenis_pengajuan);
+        console.log("  - File:", req.file ? req.file.filename : "No file");
 
-      console.log("\n📝 Creating leave request:");
-      console.log("  - User ID:", userId);
-      console.log("  - Employee ID:", employeeId);
-      console.log("  - Type:", jenis_pengajuan);
-      console.log("  - From:", tanggal_mulai, "To:", tanggal_selesai);
+        // Validasi: Jika "Sakit", wajib upload
+        if (jenis_pengajuan === "Sakit" && !req.file) {
+          return res.status(400).json({
+            error: "Surat keterangan sakit (PDF) wajib di-upload.",
+          });
+        }
 
-      // Validasi
-      if (!employeeId) {
-        return res.status(400).json({
-          error:
-            "Employee ID tidak ditemukan dalam token. Silakan login kembali.",
-        });
-      }
+        const startDate = new Date(tanggal_mulai);
+        const endDate = new Date(tanggal_selesai);
+        const totalDays = calculateLeaveDays(startDate, endDate);
 
-      if (!tanggal_mulai || !tanggal_selesai || !jenis_pengajuan) {
-        return res.status(400).json({
-          error:
-            "Tanggal mulai, tanggal selesai, dan jenis pengajuan harus diisi.",
-        });
-      }
+        // Cek kuota untuk "Cuti"
+        if (jenis_pengajuan === "Cuti") {
+          const quotaCheck = await checkLeaveQuota(
+            prisma,
+            employeeId,
+            totalDays
+          );
+          if (!quotaCheck.sufficient) {
+            return res.status(400).json({
+              error: `Kuota tidak mencukupi! Sisa: ${quotaCheck.remaining} hari.`,
+            });
+          }
+        }
 
-      // Verifikasi employee ada di database
-      const employee = await prisma.employee.findUnique({
-        where: { employee_id: parseInt(employeeId) },
-        select: { user_id: true, nama_lengkap: true },
-      });
-
-      if (!employee) {
-        return res.status(404).json({
-          error: "Data karyawan tidak ditemukan di sistem.",
-        });
-      }
-
-      // Create leave request
-      const newLeave = await prisma.leaveRequest.create({
-        data: {
+        const leaveData = {
           employee_id: parseInt(employeeId),
           tanggal_pengajuan: new Date(),
-          tanggal_mulai: new Date(tanggal_mulai),
-          tanggal_selesai: new Date(tanggal_selesai),
+          tanggal_mulai: startDate,
+          tanggal_selesai: endDate,
           jenis_pengajuan,
           alasan: alasan || "",
           status: "pending",
-        },
-        include: {
-          employee: {
-            select: {
-              nama_lengkap: true,
-              jabatan: true,
-            },
-          },
-        },
-      });
+          total_days: totalDays,
+        };
 
-      console.log("  ✅ Leave request created:", newLeave.leave_id);
-      res.status(201).json(newLeave);
+        if (req.file) {
+          leaveData.attachment_path = `/uploads/sick-letters/${req.file.filename}`;
+          leaveData.attachment_filename = req.file.filename;
+        }
+
+        const newLeave = await prisma.leaveRequest.create({
+          data: leaveData,
+          include: {
+            employee: { select: { nama_lengkap: true, jabatan: true } },
+          },
+        });
+
+        res.status(201).json({
+          ...newLeave,
+          message: "Pengajuan berhasil dikirim.",
+        });
+      } catch (error) {
+        console.error("❌ Error:", error);
+
+        if (req.file) {
+          const filePath = path.join(
+            __dirname,
+            "../uploads/sick-letters",
+            req.file.filename
+          );
+          if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        }
+
+        res
+          .status(400)
+          .json({ error: "Gagal mengajukan.", details: error.message });
+      }
+    }
+  );
+
+  // ⭐ GET - Download attachment (NO AUTH - untuk bisa dibuka di browser)
+  router.get("/attachment/:filename", async (req, res) => {
+    try {
+      const { filename } = req.params;
+      const filePath = path.join(
+        __dirname,
+        "../uploads/sick-letters",
+        filename
+      );
+
+      console.log("📄 Serving PDF:", filename);
+
+      if (!fs.existsSync(filePath)) {
+        console.error("❌ File not found:", filePath);
+        return res.status(404).json({ error: "File tidak ditemukan." });
+      }
+
+      // Set headers untuk tampilkan PDF di browser
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
+
+      // Stream file
+      const fileStream = fs.createReadStream(filePath);
+      fileStream.pipe(res);
     } catch (error) {
-      console.error("❌ Error creating leave request:", error);
-      res.status(400).json({
-        error: "Gagal mengajukan cuti.",
-        details: error.message,
-      });
+      console.error("❌ Error serving file:", error);
+      res.status(500).json({ error: "Gagal memuat file." });
     }
   });
 
-  // ✅ PUT - Update Status Approval (Hanya Admin/HR)
+  // PUT - Update status
   router.put(
     "/:id/status",
     authenticateToken,
     authorizeRole(["Admin", "HR"]),
     async (req, res) => {
-      const { id } = req.params;
-      const { status } = req.body;
-
       try {
-        console.log("\n✏️ Updating leave status:");
-        console.log("  - Leave ID:", id);
-        console.log("  - New status:", status);
+        const { id } = req.params;
+        const { status } = req.body;
 
-        if (
-          !["pending", "approved", "rejected"].includes(status.toLowerCase())
-        ) {
-          return res.status(400).json({
-            error:
-              "Status tidak valid. Gunakan: pending, approved, atau rejected",
-          });
-        }
-
-        const updatedLeave = await prisma.leaveRequest.update({
+        const leaveRequest = await prisma.leaveRequest.findUnique({
           where: { leave_id: parseInt(id) },
-          data: { status: status.toLowerCase() },
           include: {
             employee: {
               select: {
                 nama_lengkap: true,
-                jabatan: true,
+                used_leave_days_this_month: true,
+                monthly_leave_quota: true,
               },
             },
           },
         });
 
-        console.log("  ✅ Leave status updated");
-        res.json(updatedLeave);
+        if (!leaveRequest) {
+          return res.status(404).json({ error: "Data tidak ditemukan." });
+        }
+
+        const previousStatus = leaveRequest.status;
+
+        // Update kuota (hanya untuk "Cuti")
+        if (
+          status === "approved" &&
+          previousStatus === "pending" &&
+          leaveRequest.jenis_pengajuan === "Cuti"
+        ) {
+          const leaveMonth = new Date(leaveRequest.tanggal_mulai)
+            .toISOString()
+            .substring(0, 7);
+          if (leaveMonth === getCurrentMonth()) {
+            await updateEmployeeLeaveQuota(
+              prisma,
+              leaveRequest.employee_id,
+              leaveRequest.total_days
+            );
+          }
+        }
+
+        const updated = await prisma.leaveRequest.update({
+          where: { leave_id: parseInt(id) },
+          data: { status },
+          include: {
+            employee: {
+              select: {
+                nama_lengkap: true,
+                used_leave_days_this_month: true,
+                monthly_leave_quota: true,
+              },
+            },
+          },
+        });
+
+        res.json(updated);
       } catch (error) {
-        console.error("❌ Error updating leave status:", error);
-        res.status(400).json({ error: "Gagal memperbarui status cuti." });
+        console.error("❌ Error:", error);
+        res.status(400).json({ error: "Gagal update status." });
       }
     }
   );
 
-  // ✅ DELETE - Hapus cuti (Admin/HR atau Karyawan untuk cuti pending milik sendiri)
+  // DELETE
   router.delete("/:id", authenticateToken, async (req, res) => {
     try {
-      const { id } = req.params;
-      const userRole = req.user.role;
-      const employeeId = req.user.employeeId || req.user.employee_id;
-
-      console.log("\n🗑️ Deleting leave request:");
-      console.log("  - Leave ID:", id);
-      console.log("  - User role:", userRole);
-
-      // Ambil data cuti
       const leaveRequest = await prisma.leaveRequest.findUnique({
-        where: { leave_id: parseInt(id) },
+        where: { leave_id: parseInt(req.params.id) },
       });
 
       if (!leaveRequest) {
-        return res.status(404).json({ error: "Data cuti tidak ditemukan." });
+        return res.status(404).json({ error: "Data tidak ditemukan." });
       }
 
-      // Validasi akses
-      if (userRole === "Karyawan") {
-        // Karyawan hanya bisa hapus cuti sendiri yang masih pending
-        if (leaveRequest.employee_id !== parseInt(employeeId)) {
-          return res.status(403).json({
-            error: "Anda hanya bisa menghapus cuti Anda sendiri.",
-          });
-        }
-        if (leaveRequest.status !== "pending") {
-          return res.status(403).json({
-            error: "Cuti yang sudah disetujui/ditolak tidak bisa dihapus.",
-          });
-        }
+      // Hapus file jika ada
+      if (leaveRequest.attachment_filename) {
+        const filePath = path.join(
+          __dirname,
+          "../uploads/sick-letters",
+          leaveRequest.attachment_filename
+        );
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
       }
 
       await prisma.leaveRequest.delete({
-        where: { leave_id: parseInt(id) },
+        where: { leave_id: parseInt(req.params.id) },
       });
 
-      console.log("  ✅ Leave request deleted");
-      res.json({ message: "Data cuti berhasil dihapus." });
+      res.json({ message: "Berhasil dihapus." });
     } catch (error) {
-      console.error("❌ Error deleting leave:", error);
-      res.status(500).json({ error: "Gagal menghapus cuti." });
+      console.error("❌ Error:", error);
+      res.status(500).json({ error: "Gagal menghapus." });
     }
   });
 
